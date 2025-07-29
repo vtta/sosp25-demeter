@@ -1,0 +1,9 @@
+toolchain/
+build/
+bin/
+rustup
+*.tar.*
+*.tgz
+*.txz
+*.tzst
+*.o
