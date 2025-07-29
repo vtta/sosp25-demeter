@@ -1,4 +1,4 @@
-.PHONY: all ch clean build
+.PHONY: all ch clean build install
 
 all: ch
 
@@ -20,6 +20,11 @@ $(CH_SOURCE_DIR)/.stamp: patch/hypervisor.patch $(CH_BASE_TARBALL) $(CH_SOURCE_D
 
 build: ch
 	cd $(CH_SOURCE_DIR); cargo build --release --target x86_64-unknown-linux-musl
+
+install: build
+	mkdir -p bin
+	cp -vt bin \
+		$(CH_SOURCE_DIR)/target/x86_64-unknown-linux-musl/release/cloud-hypervisor
 
 clean:
 	rm -rf $(CH_SOURCE_DIR) $(CH_BASE_TARBALL)

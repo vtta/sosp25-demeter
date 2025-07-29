@@ -1,6 +1,7 @@
 toolchain/
 build/
 bin/
+out/
 hypervisor/
 rustup
 *.tar.*
@@ -9,3 +10,5 @@ rustup
 *.tzst
 *.zip
 *.o
+*.a
+root.img*

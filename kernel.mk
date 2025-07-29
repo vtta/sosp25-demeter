@@ -2,9 +2,13 @@ include environment.mk
 KERNEL_TARGETS := olddefconfig bzImage modules compile_commands.json scripts_gdb
 DEMETER_KERNELS := demeter demeterhost
 SOTA_KERNELS := memtis nomad tpp tpphost
+GUEST_KERNELS := demeter memtis nomad tpp
+HOST_KERNELS := demeterhost tpphost
 JOBS ?= $(shell nproc)
 
-.PHONY: all clean demeter sota build
+.PHONY: all clean demeter sota \
+	build $(addprefix build-,$(DEMETER_KERNELS) $(SOTA_KERNELS)) \
+	install-guest $(addprefix install-,$(GUEST_KERNELS))
 all: demeter sota
 
 # Alternative mirrors:
@@ -55,6 +59,14 @@ $(addprefix build-,$(SOTA_KERNELS)): build-%: config/%.config sota
 	ccache --zero-stats
 	$(call make-kernel,$<,$(@:build-%=$(CURDIR)/kernel/%),$(@:build-%=$(CURDIR)/build/%),$(KERNEL_TARGETS))
 	ccache --show-stats
+
+install-guest: $(addprefix install-,$(GUEST_KERNELS))
+$(addprefix install-guest-,$(GUEST_KERNELS)): install-guest-%: build-%
+	mkdir -p $(<:build-%=bin/%)
+	cp -vt $(<:build-%=bin/%) \
+		$(<:build-%=build/%)/**/compressed/vmlinux.bin \
+		$(<:build-%=build/%)/**/*.ko \
+		$(<:build-%=build/%)/**/vmlinux
 
 clean:
 	rm -rf build $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR) $(SOTA_BASE_TARBALL) $(SOTA_SOURCE_DIR)

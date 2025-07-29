@@ -3,7 +3,7 @@ include environment.mk
 export CC := gcc
 export CXX := g++
 
-.PHONY: all clean default
+.PHONY: all clean default install
 
 default: all
 
@@ -39,6 +39,11 @@ $(XSBENCH_BIN): workload/xsbench/Makefile
 
 all: $(GUPS_BIN) $(BTREE_BIN) $(BWAVES_BIN) $(GRAPH500_BIN) \
 	$(LIBLINEAR_BIN) $(PAGERANK_BIN) $(SILO_BIN) $(XSBENCH_BIN)
+
+install: $(GUPS_BIN) $(BTREE_BIN) $(BWAVES_BIN) $(GRAPH500_BIN) \
+	$(LIBLINEAR_BIN) $(PAGERANK_BIN) $(SILO_BIN) $(XSBENCH_BIN)
+	mkdir -p bin
+	cp -vt bin $?
 
 clean:
 	cd workload/gups; cargo clean
