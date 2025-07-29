@@ -1,0 +1,5 @@
+*.o
+*.bz2
+train
+predict
+kdda
