@@ -1,9 +1,11 @@
 toolchain/
 build/
 bin/
+hypervisor/
 rustup
 *.tar.*
 *.tgz
 *.txz
 *.tzst
+*.zip
 *.o
