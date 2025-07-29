@@ -1,0 +1,2103 @@
+diff --git a/.github/workflows/release.yaml b/.github/workflows/release.yaml
+index 16815d975..530d2f326 100644
+--- a/.github/workflows/release.yaml
++++ b/.github/workflows/release.yaml
+@@ -1,5 +1,5 @@
+ name: Cloud Hypervisor Release
+-on: [pull_request, create]
++on: [pull_request, create, workflow_dispatch]
+ 
+ jobs:
+   release:
+diff --git a/Cargo.toml b/Cargo.toml
+index 547bccc28..64cb11997 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -67,7 +67,7 @@ wait-timeout = "0.2.0"
+ # Please adjust `vmm::feature_list()` accordingly when changing the
+ # feature list below
+ [features]
+-default = ["kvm", "io_uring"]
++default = ["kvm", "io_uring", "guest_debug"]
+ dbus_api = ["zbus", "vmm/dbus_api"]
+ dhat-heap = ["dhat"] # For heap profiling
+ guest_debug = ["vmm/guest_debug"]
+diff --git a/option_parser/src/lib.rs b/option_parser/src/lib.rs
+index fb2dbfc83..fe46681a5 100644
+--- a/option_parser/src/lib.rs
++++ b/option_parser/src/lib.rs
+@@ -7,6 +7,7 @@ use std::collections::HashMap;
+ use std::fmt;
+ use std::num::ParseIntError;
+ use std::str::FromStr;
++use std::time::Duration;
+ 
+ #[derive(Default)]
+ pub struct OptionParser {
+@@ -211,6 +212,65 @@ impl FromStr for ByteSized {
+     }
+ }
+ 
++pub struct ByteSizedList(pub Vec<u64>);
++
++#[derive(Debug)]
++pub enum ByteSizedListParseError {
++    InvalidValue(String),
++}
++
++impl FromStr for ByteSizedList {
++    type Err = ByteSizedListParseError;
++
++    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
++        Ok(ByteSizedList(
++            s.trim()
++                .trim_matches(|c| c == '[' || c == ']')
++                .split(',')
++                .map(ByteSized::from_str)
++                .collect::<Result<Vec<_>, _>>()
++                .map_err(|_| ByteSizedListParseError::InvalidValue(s.to_owned()))?
++                .iter()
++                .map(|v| v.0)
++                .collect(),
++        ))
++    }
++}
++
++pub struct NanosecTimed(pub Duration);
++
++#[derive(Debug)]
++pub enum NanosecTimedParseError {
++    InvalidValue(String),
++}
++
++impl FromStr for NanosecTimed {
++    type Err = NanosecTimedParseError;
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        Ok(NanosecTimed({
++            let s = s.trim();
++            let pow = if s.ends_with("ns") {
++                0
++            } else if s.ends_with("us") {
++                3
++            } else if s.ends_with("ms") {
++                6
++            } else if s.ends_with('s') {
++                9
++            } else {
++                0
++            };
++
++            let s = s.trim_end_matches(|u| u == 's' || u == 'n' || u == 'u' || u == 'm');
++            let v = s
++                .parse::<u64>()
++                .map_err(|_| NanosecTimedParseError::InvalidValue(s.to_owned()))?;
++            Duration::from_nanos(v * 10u64.pow(pow))
++        }))
++    }
++}
++
+ pub struct IntegerList(pub Vec<u64>);
+ 
+ pub enum IntegerListParseError {
+diff --git a/src/bin/ch-remote.rs b/src/bin/ch-remote.rs
+index 1d5d5d0ba..eddd7df8f 100644
+--- a/src/bin/ch-remote.rs
++++ b/src/bin/ch-remote.rs
+@@ -8,7 +8,7 @@ use api_client::simple_api_command_with_fds;
+ use api_client::simple_api_full_command;
+ use api_client::Error as ApiClientError;
+ use clap::{Arg, ArgAction, ArgMatches, Command};
+-use option_parser::{ByteSized, ByteSizedParseError};
++use option_parser::{ByteSized, ByteSizedList, ByteSizedListParseError, ByteSizedParseError};
+ use std::fmt;
+ use std::io::Read;
+ use std::marker::PhantomData;
+@@ -26,7 +26,7 @@ enum Error {
+     DBusApiClient(zbus::Error),
+     InvalidCpuCount(std::num::ParseIntError),
+     InvalidMemorySize(ByteSizedParseError),
+-    InvalidBalloonSize(ByteSizedParseError),
++    InvalidBalloonSize(ByteSizedListParseError),
+     AddDeviceConfig(vmm::config::Error),
+     AddDiskConfig(vmm::config::Error),
+     AddFsConfig(vmm::config::Error),
+@@ -739,13 +739,19 @@ fn resize_config(
+         None
+     };
+ 
+-    let desired_balloon: Option<u64> = if let Some(balloon) = balloon {
+-        Some(
+-            balloon
+-                .parse::<ByteSized>()
+-                .map_err(Error::InvalidBalloonSize)?
+-                .0,
+-        )
++    let desired_balloon: Option<[u64; 2]> = if let Some(balloon) = balloon {
++        if let Ok(balloon) = balloon.parse::<ByteSized>() {
++            Some([balloon.0, 0])
++        } else {
++            Some(
++                balloon
++                    .parse::<ByteSizedList>()
++                    .map_err(Error::InvalidBalloonSize)?
++                    .0
++                    .try_into()
++                    .unwrap_or([0; 2]),
++            )
++        }
+     } else {
+         None
+     };
+diff --git a/src/main.rs b/src/main.rs
+index 426d154c9..8d9281023 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,7 +9,7 @@ extern crate event_monitor;
+ use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+ use libc::EFD_NONBLOCK;
+ use log::{warn, LevelFilter};
+-use option_parser::OptionParser;
++use option_parser::{NanosecTimed, OptionParser};
+ use seccompiler::SeccompAction;
+ use signal_hook::consts::SIGSYS;
+ use std::env;
+@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
+ use thiserror::Error;
+ #[cfg(feature = "dbus_api")]
+ use vmm::api::dbus::{dbus_api_graceful_shutdown, DBusApiOptions};
++use vmm::api::VmmEnablePMLData;
+ use vmm::config;
+ use vmm_sys_util::eventfd::EventFd;
+ use vmm_sys_util::signal::block_signal;
+@@ -81,6 +82,10 @@ enum Error {
+     LogFileCreation(std::io::Error),
+     #[error("Error setting up logger: {0}")]
+     LoggerSetup(log::SetLoggerError),
++    #[error("Error enabling heterogeneous memory: {0:?}")]
++    VmmEnablePML(vmm::api::ApiError),
++    #[error("Error parsing --pml: {0}")]
++    ParsingPML(option_parser::OptionParserError),
+ }
+ 
+ struct Logger {
+@@ -444,6 +449,16 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
+                 .group("vmm-config"),
+         );
+ 
++    let app = app.arg(
++        Arg::new("pml")
++            .long("pml")
++            .help(
++                "PML-based heterogeneous memory management \
++                \"delay=<duration>,interval=<duration>\"",
++            )
++            .num_args(1),
++    );
++
+     app.arg(
+         Arg::new("version")
+             .short('V')
+@@ -477,6 +492,28 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+     .map(|()| log::set_max_level(log_level))
+     .map_err(Error::LoggerSetup)?;
+ 
++    let vmm_enable_pml_data = if let Some(pml) = cmd_arguments.get_one::<String>("pml") {
++        let mut parser = OptionParser::new();
++        parser.add("delay").add("interval");
++        parser.parse(pml).unwrap_or_default();
++
++        let delay = parser
++            .convert::<NanosecTimed>("delay")
++            .map_err(Error::ParsingPML)?
++            .map(|v| v.0)
++            .unwrap_or_default();
++        let interval = parser
++            .convert::<NanosecTimed>("interval")
++            .map_err(Error::ParsingPML)?
++            .map(|v| v.0);
++
++        warn!("will enable heterogeneous memory support");
++        warn!("initial collection delay {delay:?} subsequent interval {interval:?}");
++        Some(VmmEnablePMLData { delay, interval })
++    } else {
++        None
++    };
++
+     let (api_socket_path, api_socket_fd) =
+         if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {
+             let mut parser = OptionParser::new();
+@@ -683,7 +720,7 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+             let sender = api_request_sender.clone();
+             vmm::api::vm_create(
+                 api_evt.try_clone().unwrap(),
+-                api_request_sender,
++                api_request_sender.clone(),
+                 Arc::new(Mutex::new(vm_config)),
+             )
+             .map_err(Error::VmCreate)?;
+@@ -691,7 +728,7 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+         } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
+             vmm::api::vm_restore(
+                 api_evt.try_clone().unwrap(),
+-                api_request_sender,
++                api_request_sender.clone(),
+                 Arc::new(
+                     config::RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
+                 ),
+@@ -699,6 +736,16 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+             .map_err(Error::VmRestore)?;
+         }
+ 
++        if let Some(data) = vmm_enable_pml_data {
++            vmm::api::vmm_enable_pml(
++                api_evt.try_clone().unwrap(),
++                api_request_sender.clone(),
++                Arc::new(data),
++            )
++            .map_err(Error::VmmEnablePML)?;
++            warn!("heterogeneous memory support is enabled");
++        }
++
+         Ok(())
+     })();
+ 
+diff --git a/tests/integration.rs b/tests/integration.rs
+index 90932c961..558e402cb 100644
+--- a/tests/integration.rs
++++ b/tests/integration.rs
+@@ -656,7 +656,7 @@ fn resize_command(
+     api_socket: &str,
+     desired_vcpus: Option<u8>,
+     desired_ram: Option<usize>,
+-    desired_balloon: Option<usize>,
++    desired_balloon: Option<[usize; 2]>,
+     event_file: Option<&str>,
+ ) -> bool {
+     let mut cmd = Command::new(clh_command("ch-remote"));
+@@ -4776,7 +4776,7 @@ mod common_parallel {
+ 
+             // Use balloon to remove RAM from the VM
+             let desired_balloon = 512 << 20;
+-            resize_command(&api_socket, None, None, Some(desired_balloon), None);
++            resize_command(&api_socket, None, None, Some([desired_balloon, 0]), None);
+ 
+             thread::sleep(std::time::Duration::new(10, 0));
+             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+@@ -4788,7 +4788,7 @@ mod common_parallel {
+ 
+             // Use balloon add RAM to the VM
+             let desired_balloon = 0;
+-            resize_command(&api_socket, None, None, Some(desired_balloon), None);
++            resize_command(&api_socket, None, None, Some([desired_balloon, 0]), None);
+ 
+             thread::sleep(std::time::Duration::new(10, 0));
+ 
+@@ -5919,7 +5919,7 @@ mod common_parallel {
+                     &api_socket_source,
+                     None,
+                     None,
+-                    Some(1 << 30),
++                    Some([1 << 30, 0]),
+                     Some(&event_path),
+                 );
+                 thread::sleep(std::time::Duration::new(5, 0));
+@@ -6093,7 +6093,7 @@ mod common_parallel {
+                 assert!(total_memory > 4_800_000);
+                 assert!(total_memory < 5_760_000);
+                 // Deflate balloon to restore entire RAM to the VM
+-                resize_command(&api_socket_restored, None, None, Some(0), None);
++                resize_command(&api_socket_restored, None, None, Some([0; 2]), None);
+                 thread::sleep(std::time::Duration::new(5, 0));
+                 assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
+                 // Decrease guest RAM with virtio-mem
+@@ -8763,7 +8763,7 @@ mod live_migration {
+             thread::sleep(std::time::Duration::new(5, 0));
+             assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
+             // Use balloon to remove RAM from the VM
+-            resize_command(&src_api_socket, None, None, Some(1 << 30), None);
++            resize_command(&src_api_socket, None, None, Some([1 << 30, 0]), None);
+             thread::sleep(std::time::Duration::new(5, 0));
+             let total_memory = guest.get_total_memory().unwrap_or_default();
+             assert!(total_memory > 4_800_000);
+@@ -8843,7 +8843,7 @@ mod live_migration {
+             assert!(total_memory > 4_800_000);
+             assert!(total_memory < 5_760_000);
+             // Deflate balloon to restore entire RAM to the VM
+-            resize_command(&dest_api_socket, None, None, Some(0), None);
++            resize_command(&dest_api_socket, None, None, Some([0; 2]), None);
+             thread::sleep(std::time::Duration::new(5, 0));
+             assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
+             // Decrease guest RAM with virtio-mem
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index a44f9f246..545d26f7f 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -13,18 +13,23 @@
+ // limitations under the License.
+ 
+ use crate::{
+-    seccomp_filters::Thread, thread_helper::spawn_virtio_thread, ActivateResult, EpollHelper,
+-    EpollHelperError, EpollHelperHandler, GuestMemoryMmap, VirtioCommon, VirtioDevice,
++    seccomp_filters::Thread, thread_helper::spawn_virtio_thread, ActivateError, ActivateResult,
++    EpollHelper, EpollHelperError, EpollHelperHandler, GuestMemoryMmap, VirtioCommon, VirtioDevice,
+     VirtioDeviceType, VirtioInterrupt, VirtioInterruptType, EPOLL_HELPER_EVENT_LAST,
+     VIRTIO_F_VERSION_1,
+ };
+ use anyhow::anyhow;
+ use seccompiler::SeccompAction;
++use std::collections::HashMap;
+ use std::io::{self, Write};
+ use std::mem::size_of;
++use std::num::Wrapping;
++use std::ops::Index;
+ use std::os::unix::io::AsRawFd;
+ use std::result;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{atomic::AtomicBool, Arc, Barrier};
++use std::time::Duration;
+ use thiserror::Error;
+ use versionize::{VersionMap, Versionize, VersionizeResult};
+ use versionize_derive::Versionize;
+@@ -37,9 +42,10 @@ use vm_memory::{
+ use vm_migration::{
+     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
+ };
+-use vmm_sys_util::eventfd::EventFd;
++use vmm_sys_util::{eventfd::EventFd, timerfd::TimerFd};
+ 
+ const QUEUE_SIZE: u16 = 128;
++const STATS_QUEUE_SIZE: u16 = 32;
+ const REPORTING_QUEUE_SIZE: u16 = 32;
+ const MIN_NUM_QUEUES: usize = 2;
+ 
+@@ -47,17 +53,41 @@ const MIN_NUM_QUEUES: usize = 2;
+ const INFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+ // Deflate virtio queue event.
+ const DEFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
++// Memory statistics virtio queue event.
++const STATS_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
++// The time interval during two memory stat requests expires.
++const STATS_TIMER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+ // Reporting virtio queue event.
+-const REPORTING_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
++const REPORTING_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
++// Heterogeneous inflate virtio queue event.
++const HETERO_INFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 6;
++// Heterogeneous deflate virtio queue event.
++const HETERO_DEFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 7;
+ 
+ // Size of a PFN in the balloon interface.
+ const VIRTIO_BALLOON_PFN_SHIFT: u64 = 12;
+ 
++// Memory statistics virtqueue
++const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1;
+ // Deflate balloon on OOM
+ const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u64 = 2;
+ // Enable an additional virtqueue to let the guest notify the host about free
+ // pages.
+ const VIRTIO_BALLOON_F_REPORTING: u64 = 5;
++// Enable an additional pair of inflate and deflate virtqueues to handle ballooning of heterogeneous memory
++const VIRTIO_BALLOON_F_HETERO_MEM: u64 = 6;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++enum BalloonVq {
++    Inflate,
++    Deflate,
++    Stats,
++    // Not supported currently
++    _FreePage,
++    Reporting,
++    HeteroInflate,
++    HeteroDeflate,
++}
+ 
+ #[derive(Error, Debug)]
+ pub enum Error {
+@@ -83,6 +113,10 @@ pub enum Error {
+     QueueAddUsed(virtio_queue::Error),
+     #[error("Failed creating an iterator over the queue: {0}")]
+     QueueIterator(virtio_queue::Error),
++    #[error("Guest sent an unexpected balloon statistic tag: {0}")]
++    UnexpectedStatTag(u16),
++    #[error("Failed to support memory statistics")]
++    MemoryStatistic,
+ }
+ 
+ // Got from include/uapi/linux/virtio_balloon.h
+@@ -93,53 +127,19 @@ pub struct VirtioBalloonConfig {
+     num_pages: u32,
+     // Number of pages we've actually got in balloon.
+     actual: u32,
+-}
+-
+-#[derive(Clone, Debug)]
+-struct PartiallyBalloonedPage {
+-    addr: u64,
+-    bitmap: Vec<u64>,
+-    page_size: u64,
+-}
+-
+-impl PartiallyBalloonedPage {
+-    fn new() -> Self {
+-        let page_size = get_page_size();
+-        let len = ((page_size >> VIRTIO_BALLOON_PFN_SHIFT) + 63) / 64;
+-        // Initial each padding bit as 1 in bitmap.
+-        let mut bitmap = vec![0_u64; len as usize];
+-        let pad_num = len * 64 - (page_size >> VIRTIO_BALLOON_PFN_SHIFT);
+-        bitmap[(len - 1) as usize] = !((1 << (64 - pad_num)) - 1);
+-        Self {
+-            addr: 0,
+-            bitmap,
+-            page_size,
+-        }
+-    }
+-
+-    fn pfn_match(&self, addr: u64) -> bool {
+-        self.addr == addr & !(self.page_size - 1)
+-    }
+-
+-    fn bitmap_full(&self) -> bool {
+-        self.bitmap.iter().all(|b| *b == u64::MAX)
+-    }
+-
+-    fn set_bit(&mut self, addr: u64) {
+-        let addr_offset = (addr % self.page_size) >> VIRTIO_BALLOON_PFN_SHIFT;
+-        self.bitmap[(addr_offset / 64) as usize] |= 1 << (addr_offset % 64);
+-    }
+-
+-    fn reset(&mut self) {
+-        let len = ((self.page_size >> VIRTIO_BALLOON_PFN_SHIFT) + 63) / 64;
+-        self.addr = 0;
+-        self.bitmap = vec![0; len as usize];
+-        let pad_num = len * 64 - (self.page_size >> VIRTIO_BALLOON_PFN_SHIFT);
+-        self.bitmap[(len - 1) as usize] = !((1 << (64 - pad_num)) - 1);
+-    }
++    // Free page hinting to speed up migration (this feature is not implemented).
++    // Caveat: should not be mixed with free page reporting
++    hint_cmd_id: u32,
++    // Deflated or reported free pages are initialized with this value (this feature is not implemented).
++    poison_val: u32,
++    // Number of heterogeneous pages host wants Guest to give up.
++    num_hetero_pages: u32,
++    // Number of heterogeneous pages we've actually got in balloon.
++    hetero_actual: u32,
+ }
+ 
+ const CONFIG_ACTUAL_OFFSET: u64 = 4;
++const CONFIG_HETERO_ACTUAL_OFFSET: u64 = 20;
+ const CONFIG_ACTUAL_SIZE: usize = 4;
+ 
+ // SAFETY: it only has data and has no implicit padding.
+@@ -148,13 +148,21 @@ unsafe impl ByteValued for VirtioBalloonConfig {}
+ struct BalloonEpollHandler {
+     mem: GuestMemoryAtomic<GuestMemoryMmap>,
+     queues: Vec<Queue>,
++    // Fix the mismatch between index into queues and BalloonVq value when some queues are not present due to unsupported features
++    queue_indices: HashMap<BalloonVq, usize>,
+     interrupt_cb: Arc<dyn VirtioInterrupt>,
+     inflate_queue_evt: EventFd,
+     deflate_queue_evt: EventFd,
++    stats_queue_evt: Option<EventFd>,
++    stats_timer_evt: Option<TimerFd>,
++    stats_polling_interval: Option<Duration>,
++    stats_queue_index: Option<usize>,
+     reporting_queue_evt: Option<EventFd>,
++    hetero_inflate_queue_evt: Option<EventFd>,
++    hetero_deflate_queue_evt: Option<EventFd>,
+     kill_evt: EventFd,
+     pause_evt: EventFd,
+-    pbp: Option<PartiallyBalloonedPage>,
++    counters: Arc<BalloonCounters>,
+ }
+ 
+ impl BalloonEpollHandler {
+@@ -211,44 +219,8 @@ impl BalloonEpollHandler {
+         Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)
+     }
+ 
+-    fn release_memory_range_4k(
+-        pbp: &mut Option<PartiallyBalloonedPage>,
+-        memory: &GuestMemoryMmap,
+-        pfn: u32,
+-    ) -> result::Result<(), Error> {
+-        let range_base = GuestAddress((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
+-        let range_len = 1 << VIRTIO_BALLOON_PFN_SHIFT;
+-
+-        let page_size: u64 = get_page_size();
+-        if page_size == 1 << VIRTIO_BALLOON_PFN_SHIFT {
+-            return Self::release_memory_range(memory, range_base, range_len);
+-        }
+-
+-        if pbp.is_none() {
+-            *pbp = Some(PartiallyBalloonedPage::new());
+-        }
+-
+-        if !pbp.as_ref().unwrap().pfn_match(range_base.0) {
+-            // We are trying to free memory region in a different pfn with current pbp. Flush pbp.
+-            pbp.as_mut().unwrap().reset();
+-            pbp.as_mut().unwrap().addr = align_page_size_down(range_base.0);
+-        }
+-
+-        pbp.as_mut().unwrap().set_bit(range_base.0);
+-        if pbp.as_ref().unwrap().bitmap_full() {
+-            Self::release_memory_range(
+-                memory,
+-                vm_memory::GuestAddress(pbp.as_ref().unwrap().addr),
+-                page_size as usize,
+-            )?;
+-
+-            pbp.as_mut().unwrap().reset();
+-        }
+-
+-        Ok(())
+-    }
+-
+-    fn process_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
++    fn process_queue(&mut self, queue: BalloonVq) -> result::Result<(), Error> {
++        let queue_index = self.queue_indices[&queue];
+         let mut used_descs = false;
+         while let Some(mut desc_chain) =
+             self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
+@@ -276,22 +248,25 @@ impl BalloonEpollHandler {
+                     .map_err(Error::GuestMemory)?;
+                 offset += data_chunk_size as u64;
+ 
+-                match queue_index {
+-                    0 => {
+-                        Self::release_memory_range_4k(&mut self.pbp, desc_chain.memory(), pfn)?;
++                let page_size = get_page_size() as usize;
++                let rbase = align_page_size_down((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
++                match queue {
++                    BalloonVq::Inflate | BalloonVq::HeteroInflate => {
++                        Self::release_memory_range(
++                            desc_chain.memory(),
++                            GuestAddress(rbase),
++                            page_size,
++                        )?;
+                     }
+-                    1 => {
+-                        let page_size = get_page_size() as usize;
+-                        let rbase = align_page_size_down((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
+-
++                    BalloonVq::Deflate | BalloonVq::HeteroDeflate => {
+                         Self::advise_memory_range(
+                             desc_chain.memory(),
+-                            vm_memory::GuestAddress(rbase),
++                            GuestAddress(rbase),
+                             page_size,
+                             libc::MADV_WILLNEED,
+                         )?;
+                     }
+-                    _ => return Err(Error::InvalidQueueIndex(queue_index)),
++                    _ => Err(Error::InvalidQueueIndex(queue_index))?,
+                 }
+             }
+ 
+@@ -308,7 +283,81 @@ impl BalloonEpollHandler {
+         }
+     }
+ 
+-    fn process_reporting_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
++    fn process_stats_timer(&mut self) -> result::Result<(), Error> {
++        // This must be set because the driver will send us a buffer after probing
++        // `process_stats_queue()` will set the queue_index upon receiving this buffer
++        let queue_index = self.stats_queue_index.ok_or(Error::MemoryStatistic)?;
++
++        self.signal(VirtioInterruptType::Queue(queue_index as u16))
++    }
++
++    fn process_stats_queue(&mut self, queue: BalloonVq) -> result::Result<(), Error> {
++        let queue_index = self.queue_indices[&queue];
++        if self.stats_queue_index.is_none() {
++            self.stats_queue_index.replace(queue_index);
++        }
++        let mut used_descs = false;
++        while let Some(mut desc_chain) =
++            self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
++        {
++            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
++
++            #[repr(C, packed)]
++            #[derive(Copy, Clone, Debug, Default, Versionize)]
++            pub struct BalloonStat {
++                tag: u16,
++                val: u64,
++            }
++            // SAFETY: BalloonStat is a POB which does not contain any pointers
++            unsafe impl ByteValued for BalloonStat {}
++
++            let data_chunk_size = size_of::<BalloonStat>();
++
++            // The head contains the request type which MUST be readable.
++            if desc.is_write_only() {
++                error!("The head contains the request type is not right");
++                return Err(Error::UnexpectedWriteOnlyDescriptor);
++            }
++            if desc.len() as usize % data_chunk_size != 0 {
++                error!("the request size {} is not right", desc.len());
++                return Err(Error::InvalidRequest);
++            }
++
++            let mut offset = 0u64;
++            while offset < desc.len() as u64 {
++                let addr = desc.addr().checked_add(offset).unwrap();
++                let stat: BalloonStat = desc_chain
++                    .memory()
++                    .read_obj(addr)
++                    .map_err(Error::GuestMemory)?;
++                offset += data_chunk_size as u64;
++                self.counters
++                    .get(stat.tag)?
++                    .store(stat.val, Ordering::Relaxed);
++            }
++            self.queues[queue_index]
++                .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
++                .map_err(Error::QueueAddUsed)?;
++            used_descs = true;
++        }
++
++        // signal the Guest after the timer goes off to refresh statistics
++        if used_descs {
++            self.stats_timer_evt
++                .as_mut()
++                .ok_or(Error::MemoryStatistic)?
++                .reset(
++                    self.stats_polling_interval.ok_or(Error::MemoryStatistic)?,
++                    None,
++                )
++                .map_err(|_| Error::MemoryStatistic)
++        } else {
++            Ok(())
++        }
++    }
++
++    fn process_reporting_queue(&mut self, queue: BalloonVq) -> result::Result<(), Error> {
++        let queue_index = self.queue_indices[&queue];
+         let mut used_descs = false;
+         while let Some(mut desc_chain) =
+             self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
+@@ -340,9 +389,28 @@ impl BalloonEpollHandler {
+         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
+         helper.add_event(self.inflate_queue_evt.as_raw_fd(), INFLATE_QUEUE_EVENT)?;
+         helper.add_event(self.deflate_queue_evt.as_raw_fd(), DEFLATE_QUEUE_EVENT)?;
++        if let Some(stats_timer_evt) = self.stats_timer_evt.as_ref() {
++            helper.add_event(stats_timer_evt.as_raw_fd(), STATS_TIMER_EVENT)?;
++        }
++        if let Some(stats_queue_evt) = self.stats_queue_evt.as_ref() {
++            helper.add_event(stats_queue_evt.as_raw_fd(), STATS_QUEUE_EVENT)?;
++        }
+         if let Some(reporting_queue_evt) = self.reporting_queue_evt.as_ref() {
+             helper.add_event(reporting_queue_evt.as_raw_fd(), REPORTING_QUEUE_EVENT)?;
+         }
++        if let Some(hetero_inflate_queue_evt) = self.hetero_inflate_queue_evt.as_ref() {
++            helper.add_event(
++                hetero_inflate_queue_evt.as_raw_fd(),
++                HETERO_INFLATE_QUEUE_EVENT,
++            )?;
++        }
++        if let Some(hetero_deflate_queue_evt) = self.hetero_deflate_queue_evt.as_ref() {
++            helper.add_event(
++                hetero_deflate_queue_evt.as_raw_fd(),
++                HETERO_DEFLATE_QUEUE_EVENT,
++            )?;
++        }
++
+         helper.run(paused, paused_sync, self)?;
+ 
+         Ok(())
+@@ -364,7 +432,7 @@ impl EpollHelperHandler for BalloonEpollHandler {
+                         e
+                     ))
+                 })?;
+-                self.process_queue(0).map_err(|e| {
++                self.process_queue(BalloonVq::Inflate).map_err(|e| {
+                     EpollHelperError::HandleEvent(anyhow!(
+                         "Failed to signal used inflate queue: {:?}",
+                         e
+@@ -378,13 +446,47 @@ impl EpollHelperHandler for BalloonEpollHandler {
+                         e
+                     ))
+                 })?;
+-                self.process_queue(1).map_err(|e| {
++                self.process_queue(BalloonVq::Deflate).map_err(|e| {
+                     EpollHelperError::HandleEvent(anyhow!(
+                         "Failed to signal used deflate queue: {:?}",
+                         e
+                     ))
+                 })?;
+             }
++            STATS_TIMER_EVENT => {
++                if let Some(_stats_timer_evt) = self.stats_timer_evt.as_ref() {
++                    self.process_stats_timer().map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to signal used statistics queue: {:?}",
++                            e
++                        ))
++                    })?;
++                } else {
++                    return Err(EpollHelperError::HandleEvent(anyhow!(
++                        "Invalid statistics timer event as no timerfd registered"
++                    )));
++                }
++            }
++            STATS_QUEUE_EVENT => {
++                if let Some(stats_queue_evt) = self.stats_queue_evt.as_ref() {
++                    stats_queue_evt.read().map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to get statistics queue event: {:?}",
++                            e
++                        ))
++                    })?;
++                    self.process_stats_queue(BalloonVq::Stats).map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to consume available memory statistics: {:?}",
++                            e
++                        ))
++                    })?;
++                } else {
++                    return Err(EpollHelperError::HandleEvent(anyhow!(
++                        "Invalid statistics queue event as no eventfd registered"
++                    )));
++                }
++            }
+             REPORTING_QUEUE_EVENT => {
+                 if let Some(reporting_queue_evt) = self.reporting_queue_evt.as_ref() {
+                     reporting_queue_evt.read().map_err(|e| {
+@@ -393,15 +495,56 @@ impl EpollHelperHandler for BalloonEpollHandler {
+                             e
+                         ))
+                     })?;
+-                    self.process_reporting_queue(2).map_err(|e| {
++                    self.process_reporting_queue(BalloonVq::Reporting)
++                        .map_err(|e| {
++                            EpollHelperError::HandleEvent(anyhow!(
++                                "Failed to signal used reporting queue: {:?}",
++                                e
++                            ))
++                        })?;
++                } else {
++                    return Err(EpollHelperError::HandleEvent(anyhow!(
++                        "Invalid reporting queue event as no eventfd registered"
++                    )));
++                }
++            }
++            HETERO_INFLATE_QUEUE_EVENT => {
++                if let Some(hetero_inflate_queue_evt) = self.hetero_inflate_queue_evt.as_ref() {
++                    hetero_inflate_queue_evt.read().map_err(|e| {
+                         EpollHelperError::HandleEvent(anyhow!(
+-                            "Failed to signal used inflate queue: {:?}",
++                            "Failed to get heterogeneous inflate queue event: {:?}",
++                            e
++                        ))
++                    })?;
++                    self.process_queue(BalloonVq::HeteroInflate).map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to signal used heterogeneous inflate queue: {:?}",
+                             e
+                         ))
+                     })?;
+                 } else {
+                     return Err(EpollHelperError::HandleEvent(anyhow!(
+-                        "Invalid reporting queue event as no eventfd registered"
++                        "Invalid heterogeneous inflate queue event as no eventfd registered"
++                    )));
++                }
++            }
++            HETERO_DEFLATE_QUEUE_EVENT => {
++                if let Some(hetero_deflate_queue_evt) = self.hetero_deflate_queue_evt.as_ref() {
++                    hetero_deflate_queue_evt.read().map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to get heterogeneous deflate queue event: {:?}",
++                            e
++                        ))
++                    })?;
++                    self.process_queue(BalloonVq::HeteroDeflate).map_err(|e| {
++                        EpollHelperError::HandleEvent(anyhow!(
++                            "Failed to signal used heterogeneous deflate queue: {:?}",
++                            e
++                        ))
++                    })?;
++                } else {
++                    return Err(EpollHelperError::HandleEvent(anyhow!(
++                        "Invalid heterogeneous deflate queue event as no eventfd registered"
+                     )));
+                 }
+             }
+@@ -433,15 +576,20 @@ pub struct Balloon {
+     seccomp_action: SeccompAction,
+     exit_evt: EventFd,
+     interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
++    counters: Arc<BalloonCounters>,
++    stats_polling_interval: Option<Duration>,
+ }
+ 
+ impl Balloon {
+     // Create a new virtio-balloon.
++    #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         id: String,
+-        size: u64,
++        size: [u64; 2],
++        stats_polling_interval: Option<Duration>,
+         deflate_on_oom: bool,
+         free_page_reporting: bool,
++        heterogeneous_memory: bool,
+         seccomp_action: SeccompAction,
+         exit_evt: EventFd,
+         state: Option<BalloonState>,
+@@ -458,24 +606,37 @@ impl Balloon {
+             )
+         } else {
+             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
++            if stats_polling_interval.is_some() {
++                avail_features |= 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
++            }
+             if deflate_on_oom {
+                 avail_features |= 1u64 << VIRTIO_BALLOON_F_DEFLATE_ON_OOM;
+             }
+             if free_page_reporting {
+                 avail_features |= 1u64 << VIRTIO_BALLOON_F_REPORTING;
+             }
++            if heterogeneous_memory {
++                avail_features |= 1u64 << VIRTIO_BALLOON_F_HETERO_MEM;
++            }
+ 
+             let config = VirtioBalloonConfig {
+-                num_pages: (size >> VIRTIO_BALLOON_PFN_SHIFT) as u32,
++                num_pages: (size[0] >> VIRTIO_BALLOON_PFN_SHIFT) as u32,
++                num_hetero_pages: (size[1] >> VIRTIO_BALLOON_PFN_SHIFT) as u32,
+                 ..Default::default()
+             };
+ 
+             (avail_features, 0, config, false)
+         };
+ 
++        if stats_polling_interval.is_some() {
++            queue_sizes.push(STATS_QUEUE_SIZE);
++        }
+         if free_page_reporting {
+             queue_sizes.push(REPORTING_QUEUE_SIZE);
+         }
++        if heterogeneous_memory {
++            queue_sizes.extend_from_slice(&[QUEUE_SIZE; 2]);
++        }
+ 
+         Ok(Balloon {
+             common: VirtioCommon {
+@@ -493,11 +654,14 @@ impl Balloon {
+             seccomp_action,
+             exit_evt,
+             interrupt_cb: None,
++            counters: Arc::new(BalloonCounters::default()),
++            stats_polling_interval,
+         })
+     }
+ 
+-    pub fn resize(&mut self, size: u64) -> Result<(), Error> {
+-        self.config.num_pages = (size >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
++    pub fn resize(&mut self, size: [u64; 2]) -> Result<(), Error> {
++        self.config.num_pages = (size[0] >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
++        self.config.num_hetero_pages = (size[1] >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
+ 
+         if let Some(interrupt_cb) = &self.interrupt_cb {
+             interrupt_cb
+@@ -513,6 +677,11 @@ impl Balloon {
+         (self.config.actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
+     }
+ 
++    // Get the actual size of the virtio-balloon.
++    pub fn get_hetero_actual(&self) -> u64 {
++        (self.config.hetero_actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
++    }
++
+     fn state(&self) -> BalloonState {
+         BalloonState {
+             avail_features: self.common.avail_features,
+@@ -559,8 +728,10 @@ impl VirtioDevice for Balloon {
+     }
+ 
+     fn write_config(&mut self, offset: u64, data: &[u8]) {
+-        // The "actual" field is the only mutable field
+-        if offset != CONFIG_ACTUAL_OFFSET || data.len() != CONFIG_ACTUAL_SIZE {
++        // The "actual" and "hetero_actual" fields are the only mutable fields
++        if (offset != CONFIG_ACTUAL_OFFSET && offset != CONFIG_HETERO_ACTUAL_OFFSET)
++            || data.len() != CONFIG_ACTUAL_SIZE
++        {
+             error!(
+                 "Attempt to write to read-only field: offset {:x} length {}",
+                 offset,
+@@ -600,15 +771,47 @@ impl VirtioDevice for Balloon {
+         let (kill_evt, pause_evt) = self.common.dup_eventfds();
+ 
+         let mut virtqueues = Vec::new();
++        let mut queue_indices = HashMap::new();
+         let (_, queue, queue_evt) = queues.remove(0);
++        queue_indices.insert(BalloonVq::Inflate, virtqueues.len());
+         virtqueues.push(queue);
+         let inflate_queue_evt = queue_evt;
+         let (_, queue, queue_evt) = queues.remove(0);
++        queue_indices.insert(BalloonVq::Deflate, virtqueues.len());
+         virtqueues.push(queue);
+         let deflate_queue_evt = queue_evt;
++        let (stats_queue_evt, stats_timer_evt) =
++            if self.common.feature_acked(VIRTIO_BALLOON_F_STATS_VQ) && !queues.is_empty() {
++                let (_, queue, queue_evt) = queues.remove(0);
++                queue_indices.insert(BalloonVq::Stats, virtqueues.len());
++                virtqueues.push(queue);
++                let timer_evt = TimerFd::new().map_err(|_| ActivateError::BadActivate)?;
++                (Some(queue_evt), Some(timer_evt))
++            } else {
++                (None, None)
++            };
+         let reporting_queue_evt =
+             if self.common.feature_acked(VIRTIO_BALLOON_F_REPORTING) && !queues.is_empty() {
+                 let (_, queue, queue_evt) = queues.remove(0);
++                queue_indices.insert(BalloonVq::Reporting, virtqueues.len());
++                virtqueues.push(queue);
++                Some(queue_evt)
++            } else {
++                None
++            };
++        let hetero_inflate_queue_evt =
++            if self.common.feature_acked(VIRTIO_BALLOON_F_HETERO_MEM) && !queues.is_empty() {
++                let (_, queue, queue_evt) = queues.remove(0);
++                queue_indices.insert(BalloonVq::HeteroInflate, virtqueues.len());
++                virtqueues.push(queue);
++                Some(queue_evt)
++            } else {
++                None
++            };
++        let hetero_deflate_queue_evt =
++            if self.common.feature_acked(VIRTIO_BALLOON_F_HETERO_MEM) && !queues.is_empty() {
++                let (_, queue, queue_evt) = queues.remove(0);
++                queue_indices.insert(BalloonVq::HeteroDeflate, virtqueues.len());
+                 virtqueues.push(queue);
+                 Some(queue_evt)
+             } else {
+@@ -617,16 +820,28 @@ impl VirtioDevice for Balloon {
+ 
+         self.interrupt_cb = Some(interrupt_cb.clone());
+ 
++        if get_page_size() != 1 << VIRTIO_BALLOON_PFN_SHIFT {
++            // Do not support mismatched page size
++            return Err(ActivateError::BadActivate);
++        }
++
+         let mut handler = BalloonEpollHandler {
+             mem,
+             queues: virtqueues,
++            queue_indices,
+             interrupt_cb,
+             inflate_queue_evt,
+             deflate_queue_evt,
++            stats_queue_evt,
++            stats_timer_evt,
++            stats_polling_interval: self.stats_polling_interval,
++            stats_queue_index: None,
+             reporting_queue_evt,
++            hetero_inflate_queue_evt,
++            hetero_deflate_queue_evt,
+             kill_evt,
+             pause_evt,
+-            pbp: None,
++            counters: self.counters.clone(),
+         };
+ 
+         let paused = self.common.paused.clone();
+@@ -652,6 +867,21 @@ impl VirtioDevice for Balloon {
+         event!("virtio-device", "reset", "id", &self.id);
+         result
+     }
++
++    fn counters(&self) -> Option<HashMap<&'static str, Wrapping<u64>>> {
++        let mut map: HashMap<_, _> = (0..16)
++            .map(|i| {
++                (
++                    // SAFETY: the maximum tag number is 11
++                    self.counters.name(i).unwrap(),
++                    Wrapping(self.counters.get(i).unwrap().load(Ordering::Relaxed)),
++                )
++            })
++            .collect();
++        map.insert("actual", Wrapping(self.get_actual()));
++        map.insert("hetero_actual", Wrapping(self.get_hetero_actual()));
++        Some(map)
++    }
+ }
+ 
+ impl Pausable for Balloon {
+@@ -675,3 +905,76 @@ impl Snapshottable for Balloon {
+ }
+ impl Transportable for Balloon {}
+ impl Migratable for Balloon {}
++
++#[derive(Debug, Default)]
++pub struct BalloonCounters {
++    swap_in: AtomicU64,
++    swap_out: AtomicU64,
++    major_faults: AtomicU64,
++    minor_faults: AtomicU64,
++    free_memory: AtomicU64,
++    total_memory: AtomicU64,
++    available_memory: AtomicU64,
++    disk_caches: AtomicU64,
++    hugetlb_allocations: AtomicU64,
++    hugetlb_failures: AtomicU64,
++    dram_accesses: AtomicU64,
++    dram_free: AtomicU64,
++    dram_total: AtomicU64,
++    pmem_accesses: AtomicU64,
++    pmem_free: AtomicU64,
++    pmem_total: AtomicU64,
++}
++
++impl Index<u16> for BalloonCounters {
++    type Output = AtomicU64;
++
++    fn index(&self, index: u16) -> &Self::Output {
++        self.get(index).expect("unexpected memory statistic tag")
++    }
++}
++
++impl BalloonCounters {
++    fn get(&self, tag: u16) -> result::Result<&AtomicU64, Error> {
++        Ok(match tag {
++            0 => &self.swap_in,
++            1 => &self.swap_out,
++            2 => &self.major_faults,
++            3 => &self.minor_faults,
++            4 => &self.free_memory,
++            5 => &self.total_memory,
++            6 => &self.available_memory,
++            7 => &self.disk_caches,
++            8 => &self.hugetlb_allocations,
++            9 => &self.hugetlb_failures,
++            10 => &self.dram_accesses,
++            11 => &self.dram_free,
++            12 => &self.dram_total,
++            13 => &self.pmem_accesses,
++            14 => &self.pmem_free,
++            15 => &self.pmem_total,
++            _ => return Err(Error::UnexpectedStatTag(tag)),
++        })
++    }
++    fn name(&self, tag: u16) -> result::Result<&'static str, Error> {
++        Ok(match tag {
++            0 => "swap_in",
++            1 => "swap_out",
++            2 => "major_faults",
++            3 => "minor_faults",
++            4 => "free_memory",
++            5 => "total_memory",
++            6 => "available_memory",
++            7 => "disk_caches",
++            8 => "hugetlb_allocations",
++            9 => "hugetlb_failures",
++            10 => "dram_accesses",
++            11 => "dram_free",
++            12 => "dram_total",
++            13 => "pmem_accesses",
++            14 => "pmem_free",
++            15 => "pmem_total",
++            _ => return Err(Error::UnexpectedStatTag(tag)),
++        })
++    }
++}
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index 41585e778..7fee747ae 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -76,7 +76,10 @@ fn create_virtio_mem_ioctl_seccomp_rule() -> Vec<SeccompRule> {
+ }
+ 
+ fn virtio_balloon_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+-    vec![(libc::SYS_fallocate, vec![])]
++    vec![
++        (libc::SYS_fallocate, vec![]),
++        (libc::SYS_timerfd_settime, vec![]),
++    ]
+ }
+ 
+ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index 727939dde..92630662a 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -182,6 +182,14 @@ impl EndpointHandler for VmActionHandler {
+                     api_sender,
+                     Arc::new(serde_json::from_slice(body.raw())?),
+                 ),
++                // If there is a body, just ignore it.
++                Boot => vm_boot(api_notifier, api_sender),
++                Delete => vm_delete(api_notifier, api_sender),
++                Shutdown => vm_shutdown(api_notifier, api_sender),
++                Reboot => vm_reboot(api_notifier, api_sender),
++                Pause => vm_pause(api_notifier, api_sender),
++                Resume => vm_resume(api_notifier, api_sender),
++                PowerButton => vm_power_button(api_notifier, api_sender),
+ 
+                 _ => return Err(HttpError::BadRequest),
+             }
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index aaae8ee34..8934bba54 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
+ use std::io;
+ use std::sync::mpsc::{channel, RecvError, SendError, Sender};
+ use std::sync::{Arc, Mutex};
++use std::time::Duration;
+ use vm_migration::MigratableError;
+ use vmm_sys_util::eventfd::EventFd;
+ 
+@@ -155,6 +156,9 @@ pub enum ApiError {
+ 
+     /// Error triggering power button
+     VmPowerButton(VmError),
++
++    /// Error enabling heterogeneous memory
++    VmEnablePML(VmError),
+ }
+ pub type ApiResult<T> = std::result::Result<T, ApiError>;
+ 
+@@ -178,7 +182,7 @@ pub struct VmmPingResponse {
+ pub struct VmResizeData {
+     pub desired_vcpus: Option<u8>,
+     pub desired_ram: Option<u64>,
+-    pub desired_balloon: Option<u64>,
++    pub desired_balloon: Option<[u64; 2]>,
+ }
+ 
+ #[derive(Clone, Deserialize, Serialize, Default, Debug)]
+@@ -219,6 +223,14 @@ pub struct VmSendMigrationData {
+     pub local: bool,
+ }
+ 
++#[derive(Clone, Deserialize, Serialize, Default, Debug)]
++pub struct VmmEnablePMLData {
++    /// The initial delay before enabling sample collection
++    pub delay: Duration,
++    /// The sample collection interval
++    pub interval: Option<Duration>,
++}
++
+ pub enum ApiResponsePayload {
+     /// No data is sent on the channel.
+     Empty,
+@@ -336,6 +348,9 @@ pub enum ApiRequest {
+ 
+     // Trigger power button
+     VmPowerButton(Sender<ApiResponse>),
++
++    /// Enable heterogeneous memory management
++    VmmEnablePML(Arc<VmmEnablePMLData>, Sender<ApiResponse>),
+ }
+ 
+ pub fn vm_create(
+@@ -432,6 +447,9 @@ pub enum VmAction {
+ 
+     /// Power Button for clean shutdown
+     PowerButton,
++
++    /// Enable heterogeneous memory
++    VmmEnablePMLData(Arc<VmmEnablePMLData>),
+ }
+ 
+ fn vm_action(
+@@ -468,6 +486,7 @@ fn vm_action(
+         ReceiveMigration(v) => ApiRequest::VmReceiveMigration(v, response_sender),
+         SendMigration(v) => ApiRequest::VmSendMigration(v, response_sender),
+         PowerButton => ApiRequest::VmPowerButton(response_sender),
++        VmmEnablePMLData(v) => ApiRequest::VmmEnablePML(v, response_sender),
+     };
+ 
+     // Send the VM request.
+@@ -693,3 +712,11 @@ pub fn vm_add_vsock(
+ ) -> ApiResult<Option<Body>> {
+     vm_action(api_evt, api_sender, VmAction::AddVsock(data))
+ }
++
++pub fn vmm_enable_pml(
++    api_evt: EventFd,
++    api_sender: Sender<ApiRequest>,
++    data: Arc<VmmEnablePMLData>,
++) -> ApiResult<Option<Body>> {
++    vm_action(api_evt, api_sender, VmAction::VmmEnablePMLData(data))
++}
+diff --git a/vmm/src/api/openapi/cloud-hypervisor.yaml b/vmm/src/api/openapi/cloud-hypervisor.yaml
+index fa855da61..494ec04be 100644
+--- a/vmm/src/api/openapi/cloud-hypervisor.yaml
++++ b/vmm/src/api/openapi/cloud-hypervisor.yaml
+@@ -13,9 +13,9 @@ servers:
+ paths:
+   /vmm.ping:
+     get:
+-      summary: Ping the VMM to check for API server availability
++      description: Ping the VMM to check for API server availability
+       responses:
+-        200:
++        "200":
+           description: The VMM information
+           content:
+             application/json:
+@@ -24,17 +24,17 @@ paths:
+ 
+   /vmm.shutdown:
+     put:
+-      summary: Shuts the cloud-hypervisor VMM.
++      description: Shuts the cloud-hypervisor VMM.
+       operationId: shutdownVMM
+       responses:
+-        204:
++        "204":
+           description: The VMM successfully shutdown.
+ 
+   /vm.info:
+     get:
+-      summary: Returns general information about the cloud-hypervisor Virtual Machine (VM) instance.
++      description: Returns general information about the cloud-hypervisor Virtual Machine (VM) instance.
+       responses:
+-        200:
++        "200":
+           description: The VM information
+           content:
+             application/json:
+@@ -43,9 +43,9 @@ paths:
+ 
+   /vm.counters:
+     get:
+-      summary: Get counters from the VM
++      description: Get counters from the VM
+       responses:
+-        200:
++        "200":
+           description: The VM counters
+           content:
+             application/json:
+@@ -54,7 +54,7 @@ paths:
+ 
+   /vm.create:
+     put:
+-      summary: Create the cloud-hypervisor Virtual Machine (VM) instance. The instance is not booted, only created.
++      description: Create the cloud-hypervisor Virtual Machine (VM) instance. The instance is not booted, only created.
+       operationId: createVM
+       requestBody:
+         description: The VM configuration
+@@ -64,90 +64,90 @@ paths:
+               $ref: "#/components/schemas/VmConfig"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully created.
+ 
+   /vm.delete:
+     put:
+-      summary: Delete the cloud-hypervisor Virtual Machine (VM) instance.
++      description: Delete the cloud-hypervisor Virtual Machine (VM) instance.
+       operationId: deleteVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully deleted.
+ 
+   /vm.boot:
+     put:
+-      summary: Boot the previously created VM instance.
++      description: Boot the previously created VM instance.
+       operationId: bootVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance successfully booted.
+-        404:
++        "404":
+           description: The VM instance could not boot because it is not created yet
+ 
+   /vm.pause:
+     put:
+-      summary: Pause a previously booted VM instance.
++      description: Pause a previously booted VM instance.
+       operationId: pauseVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance successfully paused.
+-        404:
++        "404":
+           description: The VM instance could not pause because it is not created yet
+-        405:
++        "405":
+           description: The VM instance could not pause because it is not booted.
+ 
+   /vm.resume:
+     put:
+-      summary: Resume a previously paused VM instance.
++      description: Resume a previously paused VM instance.
+       operationId: resumeVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance successfully paused.
+-        404:
++        "404":
+           description: The VM instance could not resume because it is not booted yet
+-        405:
++        "405":
+           description: The VM instance could not resume because it is not paused.
+ 
+   /vm.shutdown:
+     put:
+-      summary: Shut the VM instance down.
++      description: Shut the VM instance down.
+       operationId: shutdownVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance successfully shut down.
+-        404:
++        "404":
+           description: The VM instance could not shut down because is not created.
+-        405:
++        "405":
+           description: The VM instance could not shut down because it is not started.
+ 
+   /vm.reboot:
+     put:
+-      summary: Reboot the VM instance.
++      description: Reboot the VM instance.
+       operationId: rebootVM
+       responses:
+-        204:
++        "204":
+           description: The VM instance successfully rebooted.
+-        404:
++        "404":
+           description: The VM instance could not reboot because it is not created.
+-        405:
++        "405":
+           description: The VM instance could not reboot because it is not booted.
+ 
+   /vm.power-button:
+     put:
+-      summary: Trigger a power button in the VM
++      description: Trigger a power button in the VM
+       operationId: power-buttonVM
+       responses:
+-        204:
++        "204":
+           description: Power button successfully triggered in the VM
+-        404:
++        "404":
+           description: The button could not be triggered because it is not created yet
+-        405:
++        "405":
+           description: The button could not be triggered because it is not booted.
+ 
+   /vm.resize:
+     put:
+-      summary: Resize the VM
++      description: Resize the VM
+       requestBody:
+         description: The target size for the VM
+         content:
+@@ -156,14 +156,14 @@ paths:
+               $ref: "#/components/schemas/VmResize"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully resized.
+-        404:
++        "404":
+           description: The VM instance could not be resized because it is not created.
+ 
+   /vm.resize-zone:
+     put:
+-      summary: Resize a memory zone
++      description: Resize a memory zone
+       requestBody:
+         description: The target size for the memory zone
+         content:
+@@ -172,14 +172,14 @@ paths:
+               $ref: "#/components/schemas/VmResizeZone"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The memory zone was successfully resized.
+-        500:
++        "500":
+           description: The memory zone could not be resized.
+ 
+   /vm.add-device:
+     put:
+-      summary: Add a new device to the VM
++      description: Add a new device to the VM
+       requestBody:
+         description: The path of the new device
+         content:
+@@ -188,20 +188,20 @@ paths:
+               $ref: "#/components/schemas/DeviceConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new device was successfully (cold) added to the VM instance.
+-        404:
++        "404":
+           description: The new device could not be added to the VM instance.
+ 
+   /vm.remove-device:
+     put:
+-      summary: Remove a device from the VM
++      description: Remove a device from the VM
+       requestBody:
+         description: The identifier of the device
+         content:
+@@ -210,14 +210,14 @@ paths:
+               $ref: "#/components/schemas/VmRemoveDevice"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The device was successfully removed from the VM instance.
+-        404:
++        "404":
+           description: The device could not be removed from the VM instance.
+ 
+   /vm.add-disk:
+     put:
+-      summary: Add a new disk to the VM
++      description: Add a new disk to the VM
+       requestBody:
+         description: The details of the new disk
+         content:
+@@ -226,20 +226,20 @@ paths:
+               $ref: "#/components/schemas/DiskConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new disk was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new disk was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new disk could not be added to the VM instance.
+ 
+   /vm.add-fs:
+     put:
+-      summary: Add a new virtio-fs device to the VM
++      description: Add a new virtio-fs device to the VM
+       requestBody:
+         description: The details of the new virtio-fs
+         content:
+@@ -248,20 +248,20 @@ paths:
+               $ref: "#/components/schemas/FsConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new device was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new device could not be added to the VM instance.
+ 
+   /vm.add-pmem:
+     put:
+-      summary: Add a new pmem device to the VM
++      description: Add a new pmem device to the VM
+       requestBody:
+         description: The details of the new pmem device
+         content:
+@@ -270,20 +270,20 @@ paths:
+               $ref: "#/components/schemas/PmemConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new device was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new device could not be added to the VM instance.
+ 
+   /vm.add-net:
+     put:
+-      summary: Add a new network device to the VM
++      description: Add a new network device to the VM
+       requestBody:
+         description: The details of the new network device
+         content:
+@@ -292,20 +292,20 @@ paths:
+               $ref: "#/components/schemas/NetConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new device was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new device could not be added to the VM instance.
+ 
+   /vm.add-vsock:
+     put:
+-      summary: Add a new vsock device to the VM
++      description: Add a new vsock device to the VM
+       requestBody:
+         description: The details of the new vsock device
+         content:
+@@ -314,20 +314,20 @@ paths:
+               $ref: "#/components/schemas/VsockConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new device was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new device could not be added to the VM instance.
+ 
+   /vm.add-vdpa:
+     put:
+-      summary: Add a new vDPA device to the VM
++      description: Add a new vDPA device to the VM
+       requestBody:
+         description: The details of the new vDPA device
+         content:
+@@ -336,20 +336,20 @@ paths:
+               $ref: "#/components/schemas/VdpaConfig"
+         required: true
+       responses:
+-        200:
++        "200":
+           description: The new vDPA device was successfully added to the VM instance.
+           content:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/PciDeviceInfo"
+-        204:
++        "204":
+           description: The new vDPA device was successfully (cold) added to the VM instance.
+-        500:
++        "500":
+           description: The new vDPA device could not be added to the VM instance.
+ 
+   /vm.snapshot:
+     put:
+-      summary: Returns a VM snapshot.
++      description: Returns a VM snapshot.
+       requestBody:
+         description: The snapshot configuration
+         content:
+@@ -358,16 +358,16 @@ paths:
+               $ref: "#/components/schemas/VmSnapshotConfig"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully snapshotted.
+-        404:
++        "404":
+           description: The VM instance could not be snapshotted because it is not created.
+-        405:
++        "405":
+           description: The VM instance could not be snapshotted because it is not booted.
+ 
+   /vm.coredump:
+     put:
+-      summary: Takes a VM coredump.
++      description: Takes a VM coredump.
+       requestBody:
+         description: The coredump configuration
+         content:
+@@ -376,16 +376,16 @@ paths:
+               $ref: "#/components/schemas/VmCoredumpData"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully coredumped.
+-        404:
++        "404":
+           description: The VM instance could not be coredumped because it is not created.
+-        405:
++        "405":
+           description: The VM instance could not be coredumped because it is not booted.
+ 
+   /vm.restore:
+     put:
+-      summary: Restore a VM from a snapshot.
++      description: Restore a VM from a snapshot.
+       requestBody:
+         description: The restore configuration
+         content:
+@@ -394,14 +394,14 @@ paths:
+               $ref: "#/components/schemas/RestoreConfig"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM instance was successfully restored.
+-        404:
++        "404":
+           description: The VM instance could not be restored because it is already created.
+ 
+   /vm.receive-migration:
+     put:
+-      summary: Receive a VM migration from URL
++      description: Receive a VM migration from URL
+       requestBody:
+         description: The URL for the reception of migration state
+         content:
+@@ -410,14 +410,14 @@ paths:
+               $ref: "#/components/schemas/ReceiveMigrationData"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM migration was successfully received.
+-        500:
++        "500":
+           description: The VM migration could not be received.
+ 
+   /vm.send-migration:
+     put:
+-      summary: Send a VM migration to URL
++      description: Send a VM migration to URL
+       requestBody:
+         description: The URL for sending the migration state
+         content:
+@@ -426,9 +426,9 @@ paths:
+               $ref: "#/components/schemas/SendMigrationData"
+         required: true
+       responses:
+-        204:
++        "204":
+           description: The VM migration was successfully sent.
+-        500:
++        "500":
+           description: The VM migration could not be sent.
+ 
+ components:
+diff --git a/vmm/src/config.rs b/vmm/src/config.rs
+index 3bac721ac..aed5e2432 100644
+--- a/vmm/src/config.rs
++++ b/vmm/src/config.rs
+@@ -6,7 +6,8 @@
+ pub use crate::vm_config::*;
+ use clap::ArgMatches;
+ use option_parser::{
+-    ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
++    ByteSized, ByteSizedList, IntegerList, NanosecTimed, OptionParser, OptionParserError,
++    StringList, Toggle, Tuple,
+ };
+ use serde::{Deserialize, Serialize};
+ use std::collections::{BTreeSet, HashMap};
+@@ -162,7 +163,7 @@ pub enum ValidationError {
+     /// Invalid PCI segment id
+     InvalidPciSegment(u16),
+     /// Balloon too big
+-    BalloonLargerThanRam(u64, u64),
++    BalloonLargerThanRam([u64; 2], u64),
+     /// On a IOMMU segment but not behind IOMMU
+     OnIommuSegment(u16),
+     // On a IOMMU segment but IOMMU not supported
+@@ -262,7 +263,7 @@ impl fmt::Display for ValidationError {
+             BalloonLargerThanRam(balloon_size, ram_size) => {
+                 write!(
+                     f,
+-                    "Ballon size ({balloon_size}) greater than RAM ({ram_size})"
++                    "Ballon size ({balloon_size:?}) greater than RAM ({ram_size})"
+                 )
+             }
+             OnIommuSegment(pci_segment) => {
+@@ -1306,15 +1307,28 @@ impl BalloonConfig {
+     pub fn parse(balloon: &str) -> Result<Self> {
+         let mut parser = OptionParser::new();
+         parser.add("size");
++        parser.add("statistics");
+         parser.add("deflate_on_oom");
+         parser.add("free_page_reporting");
++        parser.add("heterogeneous_memory");
+         parser.parse(balloon).map_err(Error::ParseBalloon)?;
+ 
+-        let size = parser
+-            .convert::<ByteSized>("size")
++        let size = if let Ok(size) = parser.convert::<ByteSized>("size") {
++            [size.unwrap_or(ByteSized(0)).0, 0]
++        } else {
++            parser
++                .convert::<ByteSizedList>("size")
++                .map_err(Error::ParseBalloon)?
++                .map(|v| v.0)
++                .unwrap_or_default()
++                .try_into()
++                .unwrap_or([0; 2])
++        };
++
++        let statistics = parser
++            .convert::<NanosecTimed>("statistics")
+             .map_err(Error::ParseBalloon)?
+-            .map(|v| v.0)
+-            .unwrap_or(0);
++            .map(|x| x.0);
+ 
+         let deflate_on_oom = parser
+             .convert::<Toggle>("deflate_on_oom")
+@@ -1328,10 +1342,18 @@ impl BalloonConfig {
+             .unwrap_or(Toggle(false))
+             .0;
+ 
++        let heterogeneous_memory = parser
++            .convert::<Toggle>("heterogeneous_memory")
++            .map_err(Error::ParseBalloon)?
++            .unwrap_or(Toggle(false))
++            .0;
++
+         Ok(BalloonConfig {
+             size,
++            statistics,
+             deflate_on_oom,
+             free_page_reporting,
++            heterogeneous_memory,
+         })
+     }
+ }
+@@ -2062,7 +2084,7 @@ impl VmConfig {
+                 }
+             }
+ 
+-            if balloon.size >= ram_size {
++            if balloon.size.iter().sum::<u64>() >= ram_size {
+                 return Err(ValidationError::BalloonLargerThanRam(
+                     balloon.size,
+                     ram_size,
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 24900e787..3231feb69 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -3009,8 +3009,10 @@ impl DeviceManager {
+                 virtio_devices::Balloon::new(
+                     id.clone(),
+                     balloon_config.size,
++                    balloon_config.statistics,
+                     balloon_config.deflate_on_oom,
+                     balloon_config.free_page_reporting,
++                    balloon_config.heterogeneous_memory,
+                     self.seccomp_action.clone(),
+                     self.exit_evt
+                         .try_clone()
+@@ -4268,7 +4270,7 @@ impl DeviceManager {
+         counters
+     }
+ 
+-    pub fn resize_balloon(&mut self, size: u64) -> DeviceManagerResult<()> {
++    pub fn resize_balloon(&mut self, size: [u64; 2]) -> DeviceManagerResult<()> {
+         if let Some(balloon) = &self.balloon {
+             return balloon
+                 .lock()
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 96425b599..83750f367 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -27,6 +27,7 @@ use crate::vm::{Error as VmError, Vm, VmState};
+ use anyhow::anyhow;
+ #[cfg(feature = "dbus_api")]
+ use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
++use api::VmmEnablePMLData;
+ use libc::{tcsetattr, termios, EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW};
+ use memory_manager::MemoryManagerSnapshotData;
+ use pci::PciBdf;
+@@ -53,9 +54,11 @@ use tracer::trace_scoped;
+ use vm_memory::bitmap::AtomicBitmap;
+ use vm_migration::{protocol::*, Migratable};
+ use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
++use vmm_sys_util::errno;
+ use vmm_sys_util::eventfd::EventFd;
+ use vmm_sys_util::signal::unblock_signal;
+ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
++use vmm_sys_util::timerfd::TimerFd;
+ 
+ mod acpi;
+ pub mod api;
+@@ -108,6 +111,14 @@ pub enum Error {
+     #[error("Error reading from EventFd: {0}")]
+     EventFdRead(#[source] io::Error),
+ 
++    /// Cannot create TimerFd.
++    #[error("Error creating TimerFd: {0}")]
++    TimerFdCreate(#[source] errno::Error),
++
++    /// Cannot read from TimerFd.
++    #[error("Error waiting TimerFd: {0}")]
++    TimerFdWait(#[source] errno::Error),
++
+     /// Cannot create epoll context.
+     #[error("Error creating epoll context: {0}")]
+     Epoll(#[source] io::Error),
+@@ -189,6 +200,9 @@ pub enum Error {
+ 
+     #[error("Failed to join on threads: {0:?}")]
+     ThreadCleanup(std::boxed::Box<dyn std::any::Any + std::marker::Send>),
++
++    #[error("Cannot collect pml access samples: {0}")]
++    PMLSampleCollection(#[source] MigratableError),
+ }
+ pub type Result<T> = result::Result<T, Error>;
+ 
+@@ -200,6 +214,7 @@ pub enum EpollDispatch {
+     Api = 2,
+     ActivateVirtioDevices = 3,
+     Debug = 4,
++    PML = 5,
+     Unknown,
+ }
+ 
+@@ -212,6 +227,7 @@ impl From<u64> for EpollDispatch {
+             2 => Api,
+             3 => ActivateVirtioDevices,
+             4 => Debug,
++            5 => PML,
+             _ => Unknown,
+         }
+     }
+@@ -535,6 +551,7 @@ pub struct Vmm {
+     seccomp_action: SeccompAction,
+     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+     activate_evt: EventFd,
++    pml_evt: TimerFd,
+     signals: Option<Handle>,
+     threads: Vec<thread::JoinHandle<()>>,
+     original_termios_opt: Arc<Mutex<Option<termios>>>,
+@@ -632,6 +649,7 @@ impl Vmm {
+         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
+         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+         let activate_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
++        let pml_evt = TimerFd::new().map_err(Error::TimerFdCreate)?;
+ 
+         epoll
+             .add_event(&exit_evt, EpollDispatch::Exit)
+@@ -654,6 +672,10 @@ impl Vmm {
+             .add_event(&debug_evt, EpollDispatch::Debug)
+             .map_err(Error::Epoll)?;
+ 
++        epoll
++            .add_event(&pml_evt, EpollDispatch::PML)
++            .map_err(Error::Epoll)?;
++
+         Ok(Vmm {
+             epoll,
+             exit_evt,
+@@ -672,6 +694,7 @@ impl Vmm {
+             signals: None,
+             threads: vec![],
+             original_termios_opt: Arc::new(Mutex::new(None)),
++            pml_evt,
+         })
+     }
+ 
+@@ -985,7 +1008,7 @@ impl Vmm {
+         &mut self,
+         desired_vcpus: Option<u8>,
+         desired_ram: Option<u64>,
+-        desired_balloon: Option<u64>,
++        desired_balloon: Option<[u64; 2]>,
+     ) -> result::Result<(), VmError> {
+         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+ 
+@@ -1302,6 +1325,20 @@ impl Vmm {
+         }
+     }
+ 
++    fn vmm_enable_pml(
++        &mut self,
++        enable_pml_data: VmmEnablePMLData,
++    ) -> result::Result<(), VmError> {
++        if let Some(ref mut vm) = self.vm {
++            self.pml_evt
++                .reset(enable_pml_data.delay, enable_pml_data.interval)
++                .map_err(VmError::TimerfdError)?;
++            vm.start_dirty_log().map_err(VmError::DirtyLogError)
++        } else {
++            Err(VmError::VmNotRunning)
++        }
++    }
++
+     fn vm_receive_config<T>(
+         &mut self,
+         req: &Request,
+@@ -2170,6 +2207,13 @@ impl Vmm {
+ 
+                                     sender.send(response).map_err(Error::ApiResponseSend)?;
+                                 }
++                                ApiRequest::VmmEnablePML(enable_pml_data, sender) => {
++                                    let response = self
++                                        .vmm_enable_pml(enable_pml_data.as_ref().clone())
++                                        .map_err(ApiError::VmEnablePML)
++                                        .map(|_| ApiResponsePayload::Empty);
++                                    sender.send(response).map_err(Error::ApiResponseSend)?;
++                                }
+                             }
+                         }
+                     }
+@@ -2195,6 +2239,17 @@ impl Vmm {
+                     }
+                     #[cfg(not(feature = "guest_debug"))]
+                     EpollDispatch::Debug => {}
++                    EpollDispatch::PML => {
++                        // Consume the event.
++                        let count = self.pml_evt.wait().map_err(Error::TimerFdWait)?;
++                        info!("VM pml pending scan: {count}");
++                        if let Some(ref mut vm) = self.vm {
++                            vm.pml_collect_access_samples()
++                                .map_err(Error::PMLSampleCollection)?;
++                        } else {
++                            warn!("PML monitoring timer goes off when pml disabled");
++                        }
++                    }
+                 }
+             }
+         }
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index c6a0bec98..8254a0567 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -88,11 +88,12 @@ use vm_device::Bus;
+ #[cfg(feature = "tdx")]
+ use vm_memory::{Address, ByteValued, GuestMemory, GuestMemoryRegion};
+ use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+-use vm_migration::protocol::{Request, Response, Status};
++use vm_migration::protocol::{MemoryRange, Request, Response, Status};
+ use vm_migration::{
+     protocol::MemoryRangeTable, snapshot_from_id, Migratable, MigratableError, Pausable, Snapshot,
+     SnapshotData, Snapshottable, Transportable,
+ };
++use vmm_sys_util::errno;
+ use vmm_sys_util::eventfd::EventFd;
+ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+ 
+@@ -191,6 +192,12 @@ pub enum Error {
+     #[error("Eventfd write error: {0}")]
+     EventfdError(#[source] std::io::Error),
+ 
++    #[error("Timerfd reset error: {0}")]
++    TimerfdError(#[source] errno::Error),
++
++    #[error("Dirty log error: {0}")]
++    DirtyLogError(#[source] MigratableError),
++
+     #[error("Cannot snapshot VM: {0}")]
+     Snapshot(#[source] MigratableError),
+ 
+@@ -1269,7 +1276,7 @@ impl Vm {
+         &mut self,
+         desired_vcpus: Option<u8>,
+         desired_memory: Option<u64>,
+-        desired_balloon: Option<u64>,
++        desired_balloon: Option<[u64; 2]>,
+     ) -> Result<()> {
+         event!("vm", "resizing");
+ 
+@@ -2207,6 +2214,26 @@ impl Vm {
+         self.memory_manager.lock().unwrap().snapshot_data()
+     }
+ 
++    pub fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
++        self.memory_manager.lock().unwrap().start_dirty_log()
++    }
++
++    pub fn pml_collect_access_samples(&mut self) -> std::result::Result<(), MigratableError> {
++        let begin = std::time::Instant::now();
++        let table = self.memory_manager.lock().unwrap().dirty_log()?;
++        let len: u64 = table
++            .regions()
++            .iter()
++            .map(|&MemoryRange { gpa: _, length }| {
++                length
++            })
++            .sum();
++        let cost = std::time::Instant::now().duration_since(begin);
++        warn!("modified length {len} byte(s) extraction cost {cost:?}");
++
++        Ok(())
++    }
++
+     #[cfg(feature = "guest_debug")]
+     pub fn debug_request(
+         &mut self,
+diff --git a/vmm/src/vm_config.rs b/vmm/src/vm_config.rs
+index dc028d890..7d7f8d817 100644
+--- a/vmm/src/vm_config.rs
++++ b/vmm/src/vm_config.rs
+@@ -4,7 +4,7 @@
+ //
+ use net_util::MacAddr;
+ use serde::{Deserialize, Serialize};
+-use std::{net::Ipv4Addr, path::PathBuf};
++use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
+ use virtio_devices::RateLimiterConfig;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+@@ -379,13 +379,19 @@ impl Default for RngConfig {
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+ pub struct BalloonConfig {
+-    pub size: u64,
++    pub size: [u64; 2],
++    /// Option to report guest memory statistics.
++    #[serde(default)]
++    pub statistics: Option<Duration>,
+     /// Option to deflate the balloon in case the guest is out of memory.
+     #[serde(default)]
+     pub deflate_on_oom: bool,
+     /// Option to enable free page reporting from the guest.
+     #[serde(default)]
+     pub free_page_reporting: bool,
++    /// Option to enable ballooning heterogeneous memory.
++    #[serde(default)]
++    pub heterogeneous_memory: bool,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
