@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "bench"
+version = "0.1.0"
+description = "A benchmark framework for virtualized tier memory system"
+authors = ["Junliang HU <jlhu@cse.cuhk.edu.hk>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+fabric = "^3.2.2"
+pydantic = "^2.8.2"
+py-libnuma = "^1.2"
+httpx = "^0.27.0"
+fire = "^0.6.0"
+pandas = "^2.2.2"
+psutil = "^7.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.2"
+sympy = "^1.13.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)-8s %(name)-15s %(message)s"
