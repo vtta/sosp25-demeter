@@ -8,7 +8,8 @@ JOBS ?= $(shell nproc)
 
 .PHONY: all clean demeter sota \
 	build $(addprefix build-,$(DEMETER_KERNELS) $(SOTA_KERNELS)) \
-	install-guest $(addprefix install-,$(GUEST_KERNELS))
+	install-guest $(addprefix install-guest-,$(GUEST_KERNELS)) \
+	install-host $(addprefix install-host-,$(HOST_KERNELS))
 all: demeter sota
 
 # Alternative mirrors:
@@ -60,13 +61,25 @@ $(addprefix build-,$(SOTA_KERNELS)): build-%: config/%.config sota
 	$(call make-kernel,$<,$(@:build-%=$(CURDIR)/kernel/%),$(@:build-%=$(CURDIR)/build/%),$(KERNEL_TARGETS))
 	ccache --show-stats
 
-install-guest: $(addprefix install-,$(GUEST_KERNELS))
+install-guest: $(addprefix install-guest-,$(GUEST_KERNELS))
 $(addprefix install-guest-,$(GUEST_KERNELS)): install-guest-%: build-%
 	mkdir -p $(<:build-%=bin/%)
 	cp -vt $(<:build-%=bin/%) \
 		$(<:build-%=build/%)/**/compressed/vmlinux.bin \
 		$(<:build-%=build/%)/**/*.ko \
 		$(<:build-%=build/%)/**/vmlinux
+
+install-host: $(addprefix install-host-,$(HOST_KERNELS))
+
+install-host-demeterhost: script/linux-6.10.0-demeterhost.conf build-demeterhost
+	sudo make -C build/demeterhost modules_install
+	cd build/demeterhost; sudo installkernel 6.10.0-demeterhost arch/x86_64/boot/bzImage System.map /boot/
+	sudo cp -vt /boot/loader/entries $<
+
+install-host-tpphost: script/linux-5.15.162-tpphost.conf build-tpphost
+	sudo make -C build/tpphost modules_install
+	cd build/tpphost; sudo installkernel 5.15.162-tpphost arch/x86_64/boot/bzImage System.map /boot/
+	sudo cp -vt /boot/loader/entries $<
 
 clean:
 	rm -rf build $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR) $(SOTA_BASE_TARBALL) $(SOTA_SOURCE_DIR)
