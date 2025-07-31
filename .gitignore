@@ -12,3 +12,9 @@ rustup
 *.o
 *.a
 root.img*
+__pycache__/
+venv/
+py313/
+*.svg
+*.pdf
+*.json
