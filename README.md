@@ -45,7 +45,7 @@ Demeter is a tiered memory management solution designed for virtualized environm
 ```bash
 python3 -m venv py313
 source py313/bin/activate
-pip install fire drgn jq pandas altair[all] poetry pydantic
+pip install fire drgn jq pandas altair[all] poetry pydantic fabric
 
 # Fix Python 3.13 compatibility issue
 sed -i 's/pipes/shlex/g' py313/lib/python3.13/site-packages/fire/trace.py

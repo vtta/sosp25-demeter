@@ -23,7 +23,7 @@ $(addprefix bin/,$(GUEST_KERNELS)): bin/%: build/%
 ROOT_IMG_PARTS := root.img.zst.part0 root.img.zst.part1 root.img.zst.part2
 $(ROOT_IMG_PARTS):
 	aria2c -c -k1M -x16 \
-		https://github.com/vtta/sosp25-demeter/releases/download/root.img/$@
+		https://github.com/vtta/sosp25-demeter/releases/download/v0.0.0/$@
 
 bin/root.img: $(ROOT_IMG_PARTS)
 	mkdir -p $(dir $@)
