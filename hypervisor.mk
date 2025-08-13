@@ -1,3 +1,4 @@
+include environment.mk
 .PHONY: all ch clean build install
 
 all: ch
