@@ -2,7 +2,7 @@ TOOLCHAIN_DIR ?= $(CURDIR)/toolchain
 export RUSTUP_HOME := $(TOOLCHAIN_DIR)/rustup
 export CARGO_HOME := $(TOOLCHAIN_DIR)/cargo
 export RUSTFLAGS := -C linker=clang -C link-arg=-fuse-ld=mold
-export RUSTC_WRAPPER := sccache
+# export RUSTC_WRAPPER := sccache
 
 export LLVM := y
 export CC := ccache clang
