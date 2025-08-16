@@ -1,5 +1,6 @@
 import logging
 import os
+import grp
 import signal
 import subprocess
 import time
@@ -114,13 +115,16 @@ def sshfs(ip: str, mount: Path):
 def virtiofsd(shared: Path, socket: Path):
     return daemon(
         [
+            "sudo",
             "virtiofsd",
             "--cache=never",
             f"--socket-path={socket}",
             f"--shared-dir={shared}",
+            f"--socket-group={grp.getgrgid(os.getgid()).gr_name}",
         ],
         stdout=socket.with_suffix(".stdout"),
         stderr=socket.with_suffix(".stderr"),
+        sudo=True,
     )
 
 
