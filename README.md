@@ -206,6 +206,7 @@ poetry -C bench run pytest tests/evaluation.py -k test_delegated_realworld_workl
 **Prerequisites:**
 
 - Current kernel: `5.15.162-tpphost` (verify with `uname -r`)
+  (It is recommended to run this part with a clean environment, i.e. right after a fresh reboot)
 
 ```bash
 # Switch kernel if needed
@@ -215,6 +216,9 @@ if [[ $(uname -r) != "5.15.162-tpphost" ]]; then
 fi
 
 # Run environment setup again
+
+# Enable TPP tiering
+sudo python3 script/tpp.py echo
 
 # Start evaluation
 poetry -C bench run pytest tests/evaluation.py -k test_hypervisor_realworld_workloads
