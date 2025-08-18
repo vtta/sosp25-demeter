@@ -288,11 +288,12 @@ class Vm(BaseModel):
         )
         dir = Path(vm_debugfs[0])
         check_output(
-            f"sudo cp -r {dir} {self.out_dir} && ln -srf {self.out_dir}/{dir.name} {self.out_dir}/kvm",
-            shell=True,
-        )
-        check_output(
-            f"find {self.out_dir} -type s -delete",
+            f"""
+                sudo cp -r {dir} {self.out_dir} ;
+                sudo chown -R $(id -un):$(id -gn) {self.out_dir} ;
+                ln -srf {self.out_dir}/{dir.name} {self.out_dir}/kvm ;
+                find {self.out_dir} -type s -delete || true ;
+            """,
             shell=True,
         )
 
