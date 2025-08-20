@@ -19,7 +19,7 @@ Demeter is a tiered memory management solution designed for virtualized environm
 
 - Dual socket Intel Ice Lake server with:
   - At least 36 physical cores per CPU package
-  - At least 128GiB DDR5 DRAM paired with 512GiB Intel Optane PMEM 200 series per socket
+  - At least 128GiB DDR4 DRAM paired with 512GiB Intel Optane PMEM 200 series per socket
   - At least 1TiB available space on NVMe SSD
 
 **Software Requirements:**
@@ -149,6 +149,7 @@ sudo daxctl reconfigure-device --human --mode=system-ram all || true
 # Setup VM networking
 sudo script/network.bash --restart
 ```
+
 ### Quick Functionality Test (~2 minutes)
 
 Before running full experiments, verify the setup works:
@@ -166,7 +167,7 @@ sudo ip a
 # Test with 3 VMs
 poetry -C bench install
 poetry -C bench run python3 -m bench \
-	--num 3 --kernel demeter --mem 17179869184 \
+ --num 3 --kernel demeter --mem 17179869184 \
   --dram-ratio 0.2 --dram_node 0 --pmem_node 2 \
   run 'echo "Hello, Demeter!" | sudo tee /out/hello.log'
 ```
@@ -304,4 +305,3 @@ htop
 ├── bin/                # Binary assets for VMs (after make -f bin.mk)
 └── *.mk                # Build infrastructure makefiles
 ```
-
