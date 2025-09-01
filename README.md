@@ -1,4 +1,7 @@
-# [SOSP25] Demeter: A Scalable and Elastic Tiered Memory Solution for Virtualized Cloud via Guest Delegation
+# Demeter: A Scalable and Elastic Tiered Memory Solution for Virtualized Cloud via Guest Delegation
+This project contains the prototype system described in:
+
+> Junliang Hu, Zhisheng Hu, Chun-Feng Wu, and Ming-Chang Yang. 2025. Demeter: A Scalable and Elastic Tiered Memory Solution for Virtualized Cloud via Guest Delegation. In ACM SIGOPS 31st Symposium on Operating Systems Principles (SOSP '25), October 13–16, 2025, Seoul, Republic of Korea. ACM, New York, NY, USA, 17 pages. https://doi.org/10.1145/3731569.3764801
 
 ## Artifact Evaluation Instructions
 
@@ -272,21 +275,42 @@ The evaluation includes seven real-world applications:
 3. **Out of Memory**: Ensure swap is disabled and memory overcommit is enabled
 5. **Missing Dependencies**: Ensure all compilation steps completed successfully and binaries exist
 
-### Debug Commands
+## How to cite
 
-```bash
-# Check current kernel and boot options
-uname -r
-cat /proc/cmdline
+```yaml
+sosp25demeter:
+  type: article
+  date: 2025
+  author: [Junliang Hu, Zhisheng Hu, Chun-Feng Wu, Ming-Chang Yang]
+  title: "Demeter: A Scalable and Elastic Tiered Memory Solution for Virtualized Cloud via Guest Delegation"
+  serial-number:
+    doi: 10.1145/3731569.3764801
+    isbn: 979-8-4007-1870-0/25/10
+  parent:
+    type: proceedings
+    title: "31st Symposium on Operating Systems Principles (SOSP '25)"
+    date: 2026-10
+    location: Seoul, Republic of Korea
+    publisher: ACM, New York, NY, USA
+  tags: ["proceedings"]
+```
 
-# Verify memoy configuration
-sudo numactl --hardware
-
-# Check VM network
-sudo ip addr
-
-# Monitor system resources
-htop
+```bib
+@inproceedings{sosp25demeter,
+  address   = {New York, NY, USA},
+  author    = {Hu, Junliang and Hu, Zhisheng and Wu, Chun-Feng and Yang, Ming-Chang},
+  booktitle = {Proceedings of the 31st Symposium on Operating Systems Principles},
+  doi       = {10.1145/3731569.3764801},
+  isbn      = {9798400718700},
+  keywords  = {Virtual Machine, Virtual Memory, Operating System, Compute Express Link, Tiered Memory},
+  numpages  = {17},
+  publisher = {Association for Computing Machinery},
+  series    = {SOSP '25},
+  title     = {Demeter: A Scalable and Elastic Tiered Memory Solution for Virtualized Cloud via Guest Delegation},
+  url       = {https://doi.org/10.1145/3731569.3764801},
+  venue     = {Seoul, Republic of Korea},
+  year      = {2025}
+}
 ```
 
 ## Artifact Structure Reference
